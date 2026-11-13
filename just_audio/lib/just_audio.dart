@@ -913,8 +913,12 @@ class AudioPlayer {
       loadRequest.checkInterruption();
       return duration;
     } finally {
-      // After the platform has been handed the new sources, so that a request
-      // still in flight for a replaced one only meets a 404.
+      // Normally after the platform has been handed the new sources, so a
+      // request still in flight for a replaced one only meets a 404. When this
+      // call was interrupted, though, the interrupting call may not have
+      // handed the platform its sources yet: until it does, the platform still
+      // holds the one released here, and a further request for it meets a 404
+      // too. The interrupting call replaces it moments later.
       _releaseDetachedSources();
     }
   }
