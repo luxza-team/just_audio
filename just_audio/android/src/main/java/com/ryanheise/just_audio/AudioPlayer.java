@@ -65,10 +65,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 public class AudioPlayer implements MethodCallHandler, Player.Listener, MetadataOutput {
     public static final int ERROR_ABORT = 10000000;
@@ -441,6 +443,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 Integer initialIndex = call.argument("initialIndex");
                 Map<?, ?> audioSourceMap = call.argument("audioSource");
                 MediaSource[] children = getAudioSourcesArray(audioSourceMap.get("children"));
+                // A load carries the whole playlist: forget every source it no
+                // longer has. Without this a long-lived player that is handed a
+                // new source per clip kept one MediaSource per clip until it
+                // was disposed (#1201).
+                Set<String> loadedIds = new HashSet<String>();
+                collectIds(audioSourceMap.get("children"), loadedIds);
+                mediaSources.keySet().retainAll(loadedIds);
                 ShuffleOrder shuffleOrder = decodeShuffleOrder(mapGet(audioSourceMap, "shuffleOrder"));
                 load(Arrays.asList(children), shuffleOrder,
                         initialPosition == null ? C.TIME_UNSET : initialPosition / 1000,
@@ -680,6 +689,19 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             return new androidx.media3.exoplayer.source.ConcatenatingMediaSource(looperChildren);
         default:
             throw new IllegalArgumentException("Unknown AudioSource type: " + map.get("type"));
+        }
+    }
+
+    private void collectIds(final Object json, final Set<String> ids) {
+        if (json instanceof List) {
+            for (Object child : (List<?>)json) {
+                collectIds(child, ids);
+            }
+        } else if (json instanceof Map) {
+            Map<?, ?> map = (Map<?, ?>)json;
+            ids.add((String)map.get("id"));
+            collectIds(map.get("children"), ids);
+            collectIds(map.get("child"), ids);
         }
     }
 

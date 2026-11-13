@@ -124,6 +124,11 @@ class AudioPlayer {
   // ignore: deprecated_member_use_from_same_package
   final ConcatenatingAudioSource _playlist;
   final Map<String, AudioSource> _audioSources = {};
+
+  /// How many sources this player holds on to: the playlist itself and every
+  /// source reachable from it.
+  @visibleForTesting
+  int get registeredAudioSourceCount => _audioSources.length;
   bool _disposed = false;
   _PluginLoadRequest? _pluginLoadRequest;
   final AudioPipeline _audioPipeline;
@@ -897,15 +902,21 @@ class AudioPlayer {
       shuffleOrder: shuffleOrder ?? DefaultShuffleOrder(),
     );
     await _playlist._init(audioSources, loadRequest.shuffleOrder);
-    loadRequest.checkInterruption();
-    Duration? duration;
-    if (preload || playing) {
-      duration = await load();
-    } else {
-      await _setPlatformActive(false)?.catchError((dynamic e) async => null);
+    try {
+      loadRequest.checkInterruption();
+      Duration? duration;
+      if (preload || playing) {
+        duration = await load();
+      } else {
+        await _setPlatformActive(false)?.catchError((dynamic e) async => null);
+      }
+      loadRequest.checkInterruption();
+      return duration;
+    } finally {
+      // After the platform has been handed the new sources, so that a request
+      // still in flight for a replaced one only meets a 404.
+      _releaseDetachedSources();
     }
-    loadRequest.checkInterruption();
-    return duration;
   }
 
   /// Starts loading the playlist and returns the audio duration of the initial
@@ -988,6 +999,36 @@ class AudioPlayer {
 
   void _registerAudioSource(AudioSource source) {
     _audioSources[source._id] = source;
+  }
+
+  /// Forgets every source that is no longer reachable from the playlist.
+  ///
+  /// A source registered itself when it was attached and was only forgotten
+  /// when the player was disposed, and a [StreamAudioSource]'s proxy handler
+  /// kept the source - and so whatever it serves, e.g. its bytes - for just as
+  /// long: a long-lived player handed a new source per clip grew without bound
+  /// (#1201). Reachability, not "the sources just replaced", decides, so a
+  /// source that a newer, interrupting [setAudioSources] call has put in the
+  /// playlist is kept, and one that is set again later re-registers itself.
+  void _releaseDetachedSources() {
+    if (_disposed) return;
+    final reachable = <String>{};
+    void visit(AudioSource source) {
+      if (!reachable.add(source._id)) return;
+      source._children.forEach(visit);
+    }
+
+    visit(_playlist);
+    final detached = [
+      for (final source in _audioSources.values)
+        if (!reachable.contains(source._id)) source,
+    ];
+    for (final source in detached) {
+      _audioSources.remove(source._id);
+      if (source is StreamAudioSource) _proxy.removeStreamAudioSource(source);
+      // A source attached to another player since then is that player's.
+      if (identical(source._player, this)) source._dispose();
+    }
   }
 
   Future<Duration?> _load(
@@ -2507,6 +2548,14 @@ class _ProxyHttpServer {
     return uri;
   }
 
+  /// Stops serving [source]: a request for it is answered 404 from now on.
+  ///
+  /// [UriAudioSource]s are not removed this way: their handler is keyed by
+  /// their URI, which two sources may share, and it holds no data of its own.
+  void removeStreamAudioSource(StreamAudioSource source) {
+    _handlerMap.remove(_requestKey(Uri(path: '/id/${source._id}')));
+  }
+
   Uri _sourceUri(StreamAudioSource source) => Uri.http(
       '${InternetAddress.loopbackIPv4.address}:$port', '/id/${source._id}');
 
@@ -2765,6 +2814,9 @@ abstract class AudioSource {
   String? get _userAgent => _player?._userAgent;
 
   void _shuffle({int? initialIndex});
+
+  /// The sources nested directly inside this one.
+  List<AudioSource> get _children => const [];
 
   @mustCallSuper
   void _dispose() {
@@ -3186,6 +3238,7 @@ class ConcatenatingAudioSource extends AudioSource {
                 startIndex: index,
                 endIndex: index + 1,
                 shuffleOrder: List.of(_shuffleOrder.indices)));
+        player._releaseDetachedSources();
       }
     });
   }
@@ -3205,6 +3258,7 @@ class ConcatenatingAudioSource extends AudioSource {
                 startIndex: start,
                 endIndex: end,
                 shuffleOrder: List.of(_shuffleOrder.indices)));
+        player._releaseDetachedSources();
       }
     });
   }
@@ -3243,6 +3297,7 @@ class ConcatenatingAudioSource extends AudioSource {
                 startIndex: 0,
                 endIndex: end,
                 shuffleOrder: List.of(_shuffleOrder.indices)));
+        player._releaseDetachedSources();
       }
     });
   }
@@ -3277,6 +3332,9 @@ class ConcatenatingAudioSource extends AudioSource {
   @override
   List<IndexedAudioSource> get sequence =>
       children.expand((s) => s.sequence).toList();
+
+  @override
+  List<AudioSource> get _children => children;
 
   @override
   List<int> get shuffleIndices {
@@ -3333,6 +3391,9 @@ class ClippingAudioSource extends IndexedAudioSource {
   }
 
   @override
+  List<AudioSource> get _children => [child];
+
+  @override
   AudioSourceMessage _toMessage() => ClippingAudioSourceMessage(
       id: _id,
       child: child._toMessage() as UriAudioSourceMessage,
@@ -3372,6 +3433,9 @@ class LoopingAudioSource extends AudioSource {
   @override
   List<IndexedAudioSource> get sequence =>
       List.generate(count, (i) => child).expand((s) => s.sequence).toList();
+
+  @override
+  List<AudioSource> get _children => [child];
 
   @override
   List<int> get shuffleIndices => List.generate(count, (i) => i);

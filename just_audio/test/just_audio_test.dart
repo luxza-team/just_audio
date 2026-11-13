@@ -558,6 +558,66 @@ void runTests() {
     await player.dispose();
   });
 
+  test('a replaced stream source is released', () async {
+    final player = AudioPlayer();
+    await player.setAudioSource(TestStreamAudioSource(tag: 'first'));
+    final first = Uri.parse(player.icyMetadata!.info!.url!);
+
+    // Every source a player had loaded stayed registered, and a stream
+    // source kept its proxy handler (and through it the bytes it serves),
+    // until the player itself was disposed (#1201).
+    for (var i = 0; i < 50; i++) {
+      await player.setAudioSource(TestStreamAudioSource(tag: 'clip $i'));
+    }
+    final last = Uri.parse(player.icyMetadata!.info!.url!);
+    // The playlist and the one source it holds.
+    expect(player.registeredAudioSourceCount, equals(2));
+
+    var response = await (await HttpClient().getUrl(first)).close();
+    expect(response.statusCode, equals(HttpStatus.notFound));
+    await response.drain<void>();
+    response = await (await HttpClient().getUrl(last)).close();
+    expect(response.statusCode, equals(HttpStatus.ok));
+    await response.drain<void>();
+    await player.dispose();
+  });
+
+  test('a source set again after being replaced is served again', () async {
+    final player = AudioPlayer();
+    final a = TestStreamAudioSource(tag: 'a');
+    await player.setAudioSource(a);
+    await player.setAudioSource(TestStreamAudioSource(tag: 'b'));
+    await player.setAudioSource(a);
+    final uri = Uri.parse(player.icyMetadata!.info!.url!);
+    final response = await (await HttpClient().getUrl(uri)).close();
+    expect(response.statusCode, equals(HttpStatus.ok));
+    await response.drain<void>();
+    expect(player.registeredAudioSourceCount, equals(2));
+    await player.dispose();
+  });
+
+  test('a source removed from the playlist is released', () async {
+    final player = AudioPlayer();
+    final keep = TestStreamAudioSource(tag: 'keep');
+    final drop = TestStreamAudioSource(tag: 'drop');
+    final nested = TestStreamAudioSource(tag: 'nested');
+    await player.setAudioSources([
+      keep,
+      drop,
+      ClippingAudioSource(child: AudioSource.uri(Uri.parse('https://a.b/c'))),
+      ConcatenatingAudioSource(children: [nested]),
+    ]);
+    // playlist + keep + drop + clipping + its child + concatenating + nested
+    expect(player.registeredAudioSourceCount, equals(7));
+    await player.removeAudioSourceAt(1);
+    expect(player.registeredAudioSourceCount, equals(6));
+    await player.removeAudioSourceRange(1, 3);
+    expect(player.registeredAudioSourceCount, equals(2));
+    await player.clearAudioSources();
+    expect(player.registeredAudioSourceCount, equals(1));
+    await player.dispose();
+  });
+
   test('stream-source', () async {
     final server = MockWebServer();
     await server.start();
@@ -1922,7 +1982,11 @@ class MockAudioPlayer extends AudioPlayerPlatform {
     _broadcastPlaybackEvent();
     if (audioSource is UriAudioSourceMessage) {
       final uri = Uri.parse(audioSource.uri);
-      if (uri.path.contains('abort')) {
+      // A stream source's proxy path is `/id/<random uuid>`, which can
+      // contain "404" by chance: only the test URLs below opt into failing.
+      if (uri.path.startsWith('/id/')) {
+        _duration = audioSourceDuration;
+      } else if (uri.path.contains('abort')) {
         throw _sendError(415, 'Failed to load URL');
       } else if (uri.path.contains('404')) {
         throw _sendError(404, 'Not found: ${audioSource.uri}');
