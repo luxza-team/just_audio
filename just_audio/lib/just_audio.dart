@@ -92,6 +92,16 @@ class AudioPlayer {
   /// native platform is not needed.
   _IdleAudioPlayer? _idlePlatform;
 
+  /// The idle platforms created and not yet disposed. Each one subscribes to
+  /// [sequenceStream] and so holds the sources (and, through the proxy, their
+  /// bytes) of the moment it was made.
+  final _liveIdlePlatforms = <_IdleAudioPlayer>{};
+
+  /// How many idle platforms this player has not disposed. At most one is
+  /// current; more means a replaced one leaked.
+  @visibleForTesting
+  int get liveIdlePlatformCount => _liveIdlePlatforms.length;
+
   /// The subscription to the event channel of the current platform
   /// implementation. When switching between active and inactive modes, this is
   /// used to cancel the subscription to the previous platform's events and
@@ -1677,7 +1687,10 @@ class AudioPlayer {
         }
 
         if (!force) {
-          if (oldPlatform != null && oldPlatform is! _IdleAudioPlayer) {
+          // An idle platform is replaced just as a native one is. Left alone
+          // it keeps its [sequenceStream] subscription, and with it the
+          // sources of the moment it was made, until the player is disposed.
+          if (oldPlatform != null) {
             await _disposePlatform(oldPlatform);
           }
         }
@@ -1703,12 +1716,7 @@ class AudioPlayer {
                     _androidAudioOffloadPreferences?._toMessage(),
                 useLazyPreparation: _playlist.useLazyPreparation,
               )))
-            : (_idlePlatform = _IdleAudioPlayer(
-                id: _id = _generateId(),
-                sequenceStream: sequenceStream,
-                errorCode: playbackEvent.errorCode,
-                errorMessage: playbackEvent.errorMessage,
-              ));
+            : _newIdlePlatform();
 
         _platformValue = platform;
         return platform;
@@ -1820,9 +1828,22 @@ class AudioPlayer {
     return _platform.then((_) => durationCompleter.future);
   }
 
+  _IdleAudioPlayer _newIdlePlatform() {
+    final idle = _IdleAudioPlayer(
+      id: _id = _generateId(),
+      sequenceStream: sequenceStream,
+      errorCode: playbackEvent.errorCode,
+      errorMessage: playbackEvent.errorMessage,
+    );
+    _liveIdlePlatforms.add(idle);
+    return _idlePlatform = idle;
+  }
+
   /// Disposes of the given platform.
   Future<void> _disposePlatform(AudioPlayerPlatform platform) async {
     if (platform is _IdleAudioPlayer) {
+      _liveIdlePlatforms.remove(platform);
+      if (identical(platform, _idlePlatform)) _idlePlatform = null;
       await platform.dispose(DisposeRequest());
     } else {
       _nativePlatform = null;

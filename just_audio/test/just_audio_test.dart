@@ -503,6 +503,18 @@ void runTests() {
     await player.dispose();
   });
 
+  test('an idle platform is disposed when it is replaced', () async {
+    final player = AudioPlayer();
+    for (var i = 0; i < 20; i++) {
+      await player.setAudioSource(TestStreamAudioSource(tag: 'clip $i'));
+      await player.stop();
+    }
+    // Each stop makes a new idle platform; only the current one may remain.
+    expect(player.liveIdlePlatformCount, lessThanOrEqualTo(1));
+    await player.dispose();
+    expect(player.liveIdlePlatformCount, equals(0));
+  });
+
   test('proxy restarts after its socket is reclaimed', () async {
     final player = AudioPlayer();
     await player.setAudioSource(TestStreamAudioSource(tag: 'before'));
